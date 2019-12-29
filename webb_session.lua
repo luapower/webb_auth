@@ -1,4 +1,4 @@
-assert(ngx, 'runtime not nginx')
+assert(ngx, 'ngx not loaded')
 local base64enc  = ngx.encode_base64
 local base64dec  = ngx.decode_base64
 local ngx_var    = ngx.var
