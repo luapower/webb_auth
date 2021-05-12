@@ -26,7 +26,7 @@ CONFIG
 
 	template.reset_pass_email                 template for send_auth_token()
 
-	action['session_install.txt']             (re)create usr & session tables
+	auth_install()                            (re)create usr & session tables
 	action['login.json']                      login() server-side
 
 API DOCS
@@ -86,7 +86,7 @@ created.
 
 login using only user.
 
-	{type = 'update', email = , name = ', phone = }
+	{type = 'update', email = , name = , phone = }
 
 update the info of the currently logged in user. an attempt to change the
 email to the email of a different user results in `nil, 'email_taken'`.
@@ -115,10 +115,12 @@ anonymous then that user is also deleted afterwards.
 
 ]==]
 
-require'webb_query'
+local hmac = require'hmac'
+local glue = require'glue'
 
-local random_string = require'resty.random'
-local session = require'resty.session'
+require'webb'
+require'webb_query'
+require'webb_action'
 
 local function fullname(firstname, lastname)
 	return glue.trim((firstname or '')..' '..(lastname or ''))
@@ -126,26 +128,87 @@ end
 
 --session cookie -------------------------------------------------------------
 
+local function random_string(n)
+	local t = {}
+	for i=1,n do
+		t[i] = math.random(0, 255)
+	end
+	return string.char(unpack(t))
+end
+
+local function save_session(sess)
+	sess.expires = sess.expires or time() + 2 * 365 * 24 * 3600 --2 years
+	if sess.uid then --login
+		if not sess.id then
+			sess.id = glue.tohex(random_string(16))
+			query([[
+				insert into sess
+					(token, expires, uid)
+				values
+					(?, from_unixtime(?), ?)
+			]],
+				sess.id,
+				sess.expires,
+				sess.uid
+			)
+		else
+			query([[
+				update sess set
+					uid = ?,
+					expires = from_unixtime(?)
+				where
+					token = ?
+			]], sess.uid, sess.expires, sess.id)
+		end
+	elseif sess.id then --logout
+		query('remove from sess where token = ?', sess.id)
+	end
+	local secret = assert(config'session_secret')
+	local sig = glue.tohex(hmac.sha256(sess.id, secret))
+	setheader('set_cookie', {
+		session = {
+			value = '1|'..sess.id..'|'..sig,
+			Domain = host(),
+			Expires = sess.expires,
+			Secure = true,
+			HttpOnly = true,
+		},
+	})
+end
+
+local function load_session()
+	local cookies = headers('cookie'); if not cookies then return end
+	local session_cookie_name = config('session_cookie_name', 'session')
+	local s = cookies[session_cookie_name]; if not s then return end
+	local ver, s = s:match'^(%d)|(.*)$'; if not ver then return end
+	ver = tonumber(ver); if not ver then return end
+	if ver == 1 then
+		local sid, sig = s:match'^(.-)|(.*)$'; if not sid then return end
+		sig = glue.fromhex(sig); if not sig then return end
+		local secret = assert(config'session_secret')
+		if hmac.sha256(sid, secret) ~= sig then return end
+		local uid = query1([[
+			select uid from sess where token = ? -- and expires > now()
+		]], sid)
+		if not uid then return end
+		return {id = sid, uid = uid}
+	end
+end
 local session = once(function()
-	session.cookie.persistent = true
-	session.check.ssi = false --ssi will change after browser closes
-	session.check.ua = false  --user could upgrade the browser
-	session.cookie.lifetime = 2 * 365 * 24 * 3600 --2 years
-	session.secret = config'session_secret'
-	return assert(session.start())
+	return load_session() or {}
 end)
 
 local function session_uid()
-	return session().data.uid
+	return session().uid
 end
 
 local clear_uid_cache --fw. decl
 
 local function save_uid(uid)
-	local session = session()
-	if uid ~= session.data.uid then
-		session.data.uid = uid
-		session:save()
+	local sess = session()
+	if not sess.id or uid ~= sess.uid then
+		sess.uid = uid
+		save_session(sess)
 		clear_uid_cache()
 	end
 end
@@ -204,13 +267,15 @@ local function anonymous_uid(uid)
 end
 
 local function create_user()
-	ngx.sleep(0.2) --make filling it up a bit harder
-	return iquery([[
+	sleep(0.2) --make filling it up a bit harder
+	local uid = iquery([[
 		insert into usr
 			(clientip, atime, ctime, mtime)
 		values
 			(?, now(), now(), now())
 	]], client_ip())
+	session().uid = uid
+	return uid
 end
 
 function auth.session()
@@ -515,15 +580,13 @@ function login(auth, switch_user)
 	local uid, err = authenticate(auth)
 	local suid = valid_uid(session_uid())
 	if uid then
-		if uid ~= suid then
-			if suid then
-				switch_user(suid, uid)
-				if anonymous_uid(suid) then
-					delete_user(suid)
-				end
+		if suid and uid ~= suid then
+			switch_user(suid, uid)
+			if anonymous_uid(suid) then
+				delete_user(suid)
 			end
-			save_uid(uid)
 		end
+		save_uid(uid)
 	end
 	return uid, err
 end
@@ -568,9 +631,10 @@ end
 
 --install --------------------------------------------------------------------
 
-action['session_install.txt'] = function()
+function auth_install()
 
 	droptable'usrtoken'
+	droptable'sess'
 	droptable'usr'
 
 	print_queries(true)
@@ -601,6 +665,15 @@ action['session_install.txt'] = function()
 	]]
 
 	query[[
+	$table sess (
+		token       $hash not null primary key,
+		uid         $id not null, $fk(sess, uid, usr),
+		expires     timestamp not null,
+		ctime       $ctime
+	);
+	]]
+
+	query[[
 	$table usrtoken (
 		token       $hash not null primary key,
 		uid         $id not null, $fk(usrtoken, uid, usr),
@@ -620,3 +693,24 @@ action['login.json'] = function(...)
 
 	return uid'*'
 end
+
+if not ... then
+	require'hd'
+	if false then
+		srun(auth_install)
+	else
+		request('hd', {
+			uri = '/login.json',
+			headers = {
+				cookie = {
+					session = '1|b9871ec22558043e43c001a4c2d5eabd|1e8f88fa5c92a59f87057e903f2509339fe1054993dc6594e0da3e1ecaeac690',
+				},
+			},
+		})
+		srun(function()
+			prq(query'select * from sess')
+			prq(query'select * from usr')
+		end)
+	end
+end
+
