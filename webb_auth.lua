@@ -8,7 +8,7 @@ SESSIONS
 	login([auth][, switch_user]) -> uid       login
 	logout() -> uid                           logout and get an anonymous uid
 	uid([field|'*']) -> val | t | uid         get current user field(s) or id
-	admin() -> t|f                            user has admin rights
+	admin([role]) -> t|f                      user has admin rights or role
 	touch_usr()                               update user's atime
 	set_pass([uid, ]pass)                     set password for (current) user
 	send_auth_token(email, lang)              send auth token by email
@@ -49,9 +49,9 @@ Get full user info.
 
 Clears the session cookie and creates an anonymous user and returns it.
 
-	admin() -> t|f
+	admin([role]) -> t|f
 
-Returns true if the user has the admin flag.
+Returns true if the user has the admin rights or a certain role.
 
 	touch_usr()
 
@@ -137,6 +137,7 @@ local function random_string(n)
 end
 
 local function save_session(sess)
+	local session_cookie_name = config('session_cookie_name', 'session')
 	sess.expires = sess.expires or time() + 2 * 365 * 24 * 3600 --2 years
 	if sess.uid then --login
 		if not sess.id then
@@ -160,20 +161,28 @@ local function save_session(sess)
 					token = ?
 			]], sess.uid, sess.expires, sess.id)
 		end
+		local secret = assert(config'session_secret')
+		local sig = glue.tohex(hmac.sha256(sess.id, secret))
+		setheader('set_cookie', {
+			[session_cookie_name] = {
+				value = '1|'..sess.id..'|'..sig,
+				Domain = host(),
+				Expires = sess.expires,
+				Secure = true,
+				HttpOnly = true,
+			},
+		})
 	elseif sess.id then --logout
 		query('remove from sess where token = ?', sess.id)
+		setheader('set_cookie', {
+			[session_cookie_name] = {
+				value = '0',
+				Expires = 0,
+				Secure = true,
+				HttpOnly = true,
+			},
+		})
 	end
-	local secret = assert(config'session_secret')
-	local sig = glue.tohex(hmac.sha256(sess.id, secret))
-	setheader('set_cookie', {
-		session = {
-			value = '1|'..sess.id..'|'..sig,
-			Domain = host(),
-			Expires = sess.expires,
-			Secure = true,
-			HttpOnly = true,
-		},
-	})
 end
 
 local function load_session()
@@ -188,7 +197,7 @@ local function load_session()
 		local secret = assert(config'session_secret')
 		if hmac.sha256(sid, secret) ~= sig then return end
 		local uid = query1([[
-			select uid from sess where token = ? -- and expires > now()
+			select uid from sess where token = ? and expires > now()
 		]], sid)
 		if not uid then return end
 		return {id = sid, uid = uid}
@@ -232,7 +241,7 @@ local function userinfo(uid)
 			if(pass is not null, 1, 0) as haspass,
 			googleid,
 			facebookid,
-			admin,
+			roles,
 			--extra non-functional fields
 			name,
 			phone,
@@ -246,7 +255,8 @@ local function userinfo(uid)
 	t.anonymous = t.anonymous == 1
 	t.emailvalid = t.emailvalid == 1
 	t.haspass = tonumber(t.haspass) == 1
-	t.admin = t.admin == 1
+	t.roles = glue.index(glue.collect(glue.gsplit(t.roles or '', ' ')))
+	t.admin = t.roles.admin
 	return t
 end
 
@@ -267,7 +277,7 @@ local function anonymous_uid(uid)
 end
 
 local function create_user()
-	sleep(0.2) --make filling it up a bit harder
+	sleep(0.1) --make filling it up a bit harder
 	local uid = iquery([[
 		insert into usr
 			(clientip, atime, ctime, mtime)
@@ -278,8 +288,15 @@ local function create_user()
 	return uid
 end
 
+local function auto_create_user()
+	if not config('auto_create_user', true) then
+		return nil
+	end
+	return create_user()
+end
+
 function auth.session()
-	return valid_uid(session_uid()) or create_user()
+	return valid_uid(session_uid()) or auto_create_user()
 end
 
 --anonymous authentication ---------------------------------------------------
@@ -350,10 +367,10 @@ function auth.pass(auth)
 				emailvalid = 0,
 				email = ?,
 				pass = ?,
-				admin = ?
+				roles = ?
 			where
 				uid = ?
-			]], email, pass_hash(pass), admin, uid)
+			]], email, pass_hash(pass), admin and 'admin' or '', uid)
 		clear_userinfo_cache(uid)
 		return uid
 	end
@@ -611,8 +628,8 @@ function logout()
 	return authenticate()
 end
 
-function admin()
-	return userinfo(uid()).admin
+function admin(role)
+	return userinfo(uid()).roles[role or 'admin']
 end
 
 function touch_usr()
@@ -655,7 +672,7 @@ function auth_install()
 		gender      $name,
 		birthday    date,
 		newsletter  $bool,
-		admin       $bool,
+		roles       text,
 		note        text,
 		clientip    $name, --when it was created
 		atime       $atime, --last access time
@@ -694,6 +711,7 @@ action['login.json'] = function(...)
 	return uid'*'
 end
 
+
 if not ... then
 	require'hd'
 	if false then
@@ -703,7 +721,7 @@ if not ... then
 			uri = '/login.json',
 			headers = {
 				cookie = {
-					session = '1|b9871ec22558043e43c001a4c2d5eabd|1e8f88fa5c92a59f87057e903f2509339fe1054993dc6594e0da3e1ecaeac690',
+					session = '1|7b3c36937344221895864d7fdeec3a8f|9a1414f3f160fc5a555f48f2ecf5171c6f3a623d2f77b56f8b6fb09e6b1d4154',
 				},
 			},
 		})
