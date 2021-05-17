@@ -10,6 +10,21 @@ API
 
 */
 
+// 'firstname lastname' -> 'firstname'; 'email@domain' -> 'email'
+function firstname(name, email) {
+	if (name) {
+		name = name.trim()
+		var a = name.split(' ', 1)
+		return a.length > 0 ? a[0] : name
+	} else if (email) {
+		email = email.trim()
+		var a = email.split('@', 1)
+		return a.length > 0 ? a[0] : email
+	} else {
+		return ''
+	}
+}
+
 var admin_ = false
 
 function login(auth, success, error, opt, arg) {
