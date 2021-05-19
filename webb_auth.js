@@ -6,7 +6,7 @@
 API
 
 	login([auth], [success][, error], [opt])
-	^usr, usr                                logged-in user changed
+	^usr(usr)                                   logged-in user changed
 
 */
 
@@ -43,13 +43,13 @@ function login(auth, success, error, opt, arg) {
 		if (error)
 			error(err, msg)
 	}
-	opt = $.extend({
+	opt = assign({
 			url: '/login.json' + (arg || ''),
 			success: logged_in,
 			error: login_failed,
 			data: auth,
 		}, opt)
-	$(opt.dst || document).ajax(opt)
+	;(opt.dst || document.body).ajax(opt)
 }
 
 function logout(success, error, opt) {
@@ -66,6 +66,6 @@ function allow(truth) {
 }
 
 $.fn.login = function(auth, success, error, opt) {
-	login(auth, success, error, $.extend({dst: $(this)}, opt))
+	login(auth, success, error, assign({dst: this}, opt))
 	return this
 }

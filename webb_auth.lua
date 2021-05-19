@@ -1,6 +1,6 @@
 --[==[
 
-	webb | cookie/db-based session & authentication
+	webb | session-based authentication
 	Written by Cosmin Apreutesei. Public Domain.
 
 SESSIONS
@@ -700,8 +700,8 @@ function auth_install()
 
 end
 
-action['login.json'] = function(...)
-	if ... == 'logout' then
+action['login.json'] = function(action)
+	if action == 'logout' then
 		allow(logout())
 	else
 		local auth = post()
