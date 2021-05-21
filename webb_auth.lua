@@ -711,7 +711,6 @@ action['login.json'] = function(action)
 	return uid'*'
 end
 
-
 if not ... then
 	require'hd'
 	if false then
