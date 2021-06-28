@@ -26,7 +26,8 @@ CONFIG
 
 	template.reset_pass_email                 template for send_auth_token()
 
-	auth_install()                            (re)create usr & session tables
+	auth_create_tables()                      (re)create usr & session tables
+	auth_drop_tables()
 	action['login.json']                      login() server-side
 
 API DOCS
@@ -139,31 +140,32 @@ end
 local function save_session(sess)
 	local session_cookie_name = config('session_cookie_name', 'session')
 	sess.expires = sess.expires or time() + 2 * 365 * 24 * 3600 --2 years
-	if sess.uid then --login
+	if sess.usr then --login
 		if not sess.id then
 			sess.id = glue.tohex(random_string(16))
 			query([[
 				insert into sess
-					(token, expires, uid)
+					(token, expires, usr)
 				values
 					(?, from_unixtime(?), ?)
 			]],
 				sess.id,
 				sess.expires,
-				sess.uid
+				sess.usr
 			)
 		else
 			query([[
 				update sess set
-					uid = ?,
+					usr = ?,
 					expires = from_unixtime(?)
 				where
 					token = ?
-			]], sess.uid, sess.expires, sess.id)
+			]], sess.usr, sess.expires, sess.id)
 		end
 		local secret = assert(config'session_secret')
+		assert(#secret >= 32, 'session_secret too short')
 		local sig = glue.tohex(hmac.sha256(sess.id, secret))
-		setheader('set_cookie', {
+		setheader('set-cookie', {
 			[session_cookie_name] = {
 				value = '1|'..sess.id..'|'..sig,
 				Domain = host(),
@@ -174,7 +176,7 @@ local function save_session(sess)
 		})
 	elseif sess.id then --logout
 		query('remove from sess where token = ?', sess.id)
-		setheader('set_cookie', {
+		setheader('set-cookie', {
 			[session_cookie_name] = {
 				value = '0',
 				Expires = 0,
@@ -197,26 +199,26 @@ local function load_session()
 		local secret = assert(config'session_secret')
 		if hmac.sha256(sid, secret) ~= sig then return end
 		local uid = query1([[
-			select uid from sess where token = ? and expires > now()
+			select usr from sess where token = ? and expires > now()
 		]], sid)
-		if not uid then return end
-		return {id = sid, uid = uid}
+		if not usr then return end
+		return {id = sid, usr = uid}
 	end
 end
-local session = once(function()
+local function session()
 	return load_session() or {}
-end)
+end
 
 local function session_uid()
-	return session().uid
+	return session().usr
 end
 
 local clear_uid_cache --fw. decl
 
 local function save_uid(uid)
 	local sess = session()
-	if not sess.id or uid ~= sess.uid then
-		sess.uid = uid
+	if not sess.id or uid ~= sess.usr then
+		sess.usr = uid
 		save_session(sess)
 		clear_uid_cache()
 	end
@@ -234,7 +236,7 @@ local function userinfo(uid)
 	if not uid then return {} end
 	local t = query1([[
 		select
-			uid,
+			usr,
 			email,
 			anonymous,
 			emailvalid,
@@ -249,7 +251,7 @@ local function userinfo(uid)
 		from
 			usr
 		where
-			active = 1 and uid = ?
+			active = 1 and usr = ?
 		]], uid)
 	if not t then return {} end
 	t.anonymous = t.anonymous == 1
@@ -264,12 +266,10 @@ local function clear_userinfo_cache(uid)
 	once(userinfo, true, uid)
 end
 
-local userinfo = once(userinfo)
-
 --session-cookie authentication ----------------------------------------------
 
 local function valid_uid(uid)
-	return userinfo(uid).uid
+	return userinfo(uid).usr
 end
 
 local function anonymous_uid(uid)
@@ -284,7 +284,7 @@ local function create_user()
 		values
 			(?, now(), now(), now())
 	]], client_ip())
-	session().uid = uid
+	session().usr = uid
 	return uid
 end
 
@@ -381,12 +381,12 @@ function set_pass(uid, pass)
 		uid, pass = nil, uid
 	end
 	if not uid then
-		local usr = userinfo(allow(session_uid()))
-		allow(usr.uid)
-		allow(usr.haspass)
-		uid = usr.uid
+		local t = userinfo(allow(session_uid()))
+		allow(t.usr)
+		allow(t.haspass)
+		uid = t.usr
 	end
-	query('update usr set pass = ? where uid = ?', pass_hash(pass), uid)
+	query('update usr set pass = ? where usr = ?', pass_hash(pass), uid)
 	clear_userinfo_cache(uid)
 end
 
@@ -395,7 +395,7 @@ end
 function auth.update(auth)
 	local uid = allow(session_uid())
 	local usr = userinfo(uid)
-	allow(usr.uid)
+	allow(usr.usr)
 	local email = glue.trim(assert(auth.email))
 	local name = glue.trim(assert(auth.name))
 	local phone = glue.trim(assert(auth.phone))
@@ -608,7 +608,7 @@ function login(auth, switch_user)
 	return uid, err
 end
 
-uid = once(function(attr)
+uid = function(attr)
 	local uid = login()
 	if attr == '*' then
 		return userinfo(uid)
@@ -617,7 +617,7 @@ uid = once(function(attr)
 	else
 		return uid
 	end
-end)
+end
 
 function clear_uid_cache() --local, fw. declared
 	once(uid, true)
@@ -648,17 +648,17 @@ end
 
 --install --------------------------------------------------------------------
 
-function auth_install()
+function auth_drop_tables()
+	drop_table'usrtoken'
+	drop_table'sess'
+	drop_table'usr'
+end
 
-	droptable'usrtoken'
-	droptable'sess'
-	droptable'usr'
-
-	print_queries(true)
+function auth_create_tables()
 
 	query[[
 	$table usr (
-		uid         $pk,
+		usr         $pk,
 		anonymous   $bool1,
 		email       $email,
 		emailvalid  $bool,
@@ -684,7 +684,7 @@ function auth_install()
 	query[[
 	$table sess (
 		token       $hash not null primary key,
-		uid         $id not null, $fk(sess, uid, usr),
+		usr         $id not null, $fk(sess, usr, usr),
 		expires     timestamp not null,
 		ctime       $ctime
 	);
@@ -693,7 +693,7 @@ function auth_install()
 	query[[
 	$table usrtoken (
 		token       $hash not null primary key,
-		uid         $id not null, $fk(usrtoken, uid, usr),
+		usr         $id not null, $fk(usrtoken, usr, usr),
 		ctime       $ctime
 	);
 	]]
@@ -714,7 +714,7 @@ end
 if not ... then
 	require'hd'
 	if false then
-		srun(auth_install)
+		srun(auth_create_tables)
 	else
 		request('hd', {
 			uri = '/login.json',
